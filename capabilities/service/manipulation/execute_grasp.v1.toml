@@ -1,0 +1,29 @@
+# Plan + execute a grasp motion. Caller provides a target grasp pose
+# (geometry_msgs/PoseStamped with frame_id, typically
+# camera_color_optical_frame from yolo_grasp_rbnx) plus a gripper
+# width. The service:
+#   1. Publishes a GraspPose on /graspnet/grasps to wake up the C++
+#      moveit_control_node_yolo subscriber, which transforms the
+#      pose to arm/base_link, plans with MoveIt, and executes.
+#   2. Polls /arm/arm_status (piper_msgs/PiperStatusMsg) for the
+#      busy → idle transition.
+#   3. Returns success once arm reaches the goal (or timeout).
+#
+# Why route through a ROS topic + status poll instead of an MCP
+# direct call into MoveIt: keeps the C++ moveit_control logic
+# untouched (battle-tested), the topic interface is what the legacy
+# pick.py + piper_moveit_control already speak. We just put a typed
+# atlas-routed front door on it.
+#
+# IDL: lib/manipulation/srv/ExecuteGrasp.srv (package-local).
+[contract]
+id      = "robonix/service/manipulation/execute_grasp"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/ExecuteGrasp.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true

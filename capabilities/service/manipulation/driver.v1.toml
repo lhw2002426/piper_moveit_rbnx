@@ -1,0 +1,13 @@
+# Lifecycle interface every manipulation service implementation MUST
+# declare. `rbnx boot` calls Driver(CMD_INIT, config_json) against this
+# AFTER all primitives are init'd (we depend on primitive/arm/* and
+# primitive/tf for MoveIt's TF subscriber) and AFTER perception
+# services that produce grasp poses (informational, not blocking).
+[contract]
+id      = "robonix/service/manipulation/driver"
+version = "1"
+kind    = "service"
+idl     = "lifecycle/srv/Driver.srv"
+
+[mode]
+type = "rpc"

@@ -1,0 +1,28 @@
+# Plan + execute a grasp motion. Send a target pose (typically in
+# camera_color_optical_frame) and a gripper width; service plans
+# with MoveIt and runs the trajectory on the real arm via
+# piper_ctl_rbnx.
+
+# Request
+geometry_msgs/PoseStamped target_pose
+
+# Gripper opening width (m). Caller-determined (yolo_grasp_rbnx
+# computes it from object dimensions). 0.0 = fully closed, ≈0.07 =
+# fully open for the Piper gripper.
+float32 gripper_width
+
+# Maximum time to wait for arm motion completion (s). Includes both
+# planning and execution. Recommended: 20.0 s for normal grasps;
+# longer if the workspace is cluttered (more planning attempts).
+float32 timeout_s
+---
+# Response
+bool   success
+
+# Human-readable status. On failure: planning_failed / execution_failed
+# / timeout / arm_busy / etc. On success: "ok".
+string message
+
+# How long the whole operation took (s). 0.0 if it failed before
+# starting (e.g. no /graspnet/grasps subscriber detected).
+float32 elapsed_s

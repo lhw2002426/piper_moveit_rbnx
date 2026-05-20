@@ -1,0 +1,15 @@
+# rbnx build artifacts (large — colcon builds the C++ executor here)
+rbnx-build/
+
+# python bytecode
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# editor / OS
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/

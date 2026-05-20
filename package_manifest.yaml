@@ -1,0 +1,64 @@
+# piper_moveit_rbnx — manipulation service.
+#
+# Wraps:
+#   * piper_with_gripper_moveit  (MoveIt setup_assistant config +
+#                                 URDF/SRDF + ros2_controllers.yaml)
+#   * piper_moveit_control       (the C++ moveit_control_node_yolo
+#                                 — actual grasp executor)
+#   * piper_humble               (legacy MoveIt config alongside; kept
+#                                 only because piper_with_gripper_moveit
+#                                 cmakelists references package layout)
+#   * piper_msgs / graspnet_msgs (ROS msg/srv bindings)
+#
+# Owns `robonix/service/manipulation/*`.
+#
+# Surface design (most-conservative path picked):
+#   * NEW   atlas-routed MCP    manipulation/execute_grasp  (Pilot's view)
+#   * KEPT  ROS topic           /graspnet/grasps           (the cpp node
+#                                                            still consumes it
+#                                                            — pick.py and
+#                                                            yolo_grasp_rbnx
+#                                                            also publish here)
+#
+# The MCP handler does NOT reimplement MoveIt logic in Python. It
+# repackages the input PoseStamped into a graspnet_msgs/GraspPose,
+# publishes on /graspnet/grasps to wake the C++ executor, then polls
+# /arm/arm_status (PiperStatusMsg) for the busy → idle transition
+# (semantically identical to what pick.py does upstream). This keeps
+# all MoveIt API surface in the C++ node we vendor verbatim.
+#
+# Lifecycle:
+#   on_init      — heavy: parse cfg, log atlas deps, spawn rclpy
+#                  bridge thread (publisher + arm_status subscriber),
+#                  spawn `ros2 launch piper_moveit_rbnx.launch.py`,
+#                  sentinel-wait for /arm/arm_status (proves
+#                  piper_ctl_rbnx is ACTIVE).
+#   on_deactivate — kill launch process group + stop rclpy thread.
+#
+# Capability surface:
+#   service/manipulation/driver         mode=rpc  transport=gRPC  Driver(INIT)
+#   service/manipulation/execute_grasp  mode=rpc  transport=MCP   ExecuteGrasp.srv
+#
+# Vendored ROS packages (in src/):
+#   piper_moveit/{piper_with_gripper_moveit, piper_no_gripper_moveit}
+#   piper_moveit_control                                  (C++)
+#   piper_humble                                          (empty shell)
+#   piper_msgs                                            (PiperStatusMsg etc.)
+#   graspnet_msgs                                         (GraspPose etc.)
+manifestVersion: 1
+
+package:
+  name: com.robonix.piper_grasp.piper_moveit
+  version: 0.1.0
+  vendor: robonix
+  description: MoveIt + grasp executor (atlas-routed manipulation service).
+  license: MulanPSL-2.0
+
+capability_id: piper_moveit
+
+build: bash scripts/build.sh
+start: bash scripts/start.sh
+
+capabilities:
+  - name: robonix/service/manipulation/driver
+  - name: robonix/service/manipulation/execute_grasp

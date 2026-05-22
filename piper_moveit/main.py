@@ -83,6 +83,7 @@ _ros_node = None
 _ros_thread: Optional[threading.Thread] = None
 _ros_stop_evt = threading.Event()
 _grasps_pub = None              # /graspnet/grasps publisher
+_reset_client = None            # /moveit_control/reset Trigger client
 _arm_status_lock = threading.Lock()
 _last_arm_status_value: Optional[int] = None      # PiperStatusMsg.arm_status
 _last_arm_status_stamp: float = 0.0               # monotonic ts
@@ -169,18 +170,27 @@ def _ros_thread_main() -> None:
       * publisher  /graspnet/grasps      (graspnet_msgs/msg/GraspPose)
       * subscriber /arm/arm_status       (piper_msgs/msg/PiperStatusMsg)
     """
-    global _ros_node, _grasps_pub, _last_arm_status_value, _last_arm_status_stamp
+    global _ros_node, _grasps_pub, _reset_client, _last_arm_status_value, _last_arm_status_stamp
 
     import rclpy                                              # noqa: E402
     from rclpy.node import Node                               # noqa: E402
     from graspnet_msgs.msg import GraspPose                   # noqa: E402
     from piper_msgs.msg import PiperStatusMsg                 # noqa: E402
+    from std_srvs.srv import Trigger                          # noqa: E402
 
     rclpy.init(args=None)
     node = Node("piper_moveit_bridge")
     _ros_node = node
 
     _grasps_pub = node.create_publisher(GraspPose, "/graspnet/grasps", 10)
+
+    # Reset client — calls into the cpp moveit_control_node_yolo's
+    # /moveit_control/reset service to clear the sticky state machine
+    # (is_busy_, need_to_adjust_gripper_, need_to_return_init_pose_)
+    # and park the arm at init. Surfaced to atlas as the
+    # `manipulation/reset` MCP tool that pick_skill calls before
+    # every pick().
+    _reset_client = node.create_client(Trigger, "/moveit_control/reset")
 
     def _arm_status_cb(msg):
         global _last_arm_status_value, _last_arm_status_stamp
@@ -340,6 +350,7 @@ def deactivate():
 # ── atlas-routed MCP handler (Pilot's view) ─────────────────────────────────
 from manipulation_mcp import (  # noqa: E402  pylint: disable=wrong-import-position
     ExecuteGrasp_Request, ExecuteGrasp_Response,
+    Reset_Request, Reset_Response,
 )
 
 
@@ -424,6 +435,99 @@ def execute_grasp(req: ExecuteGrasp_Request) -> ExecuteGrasp_Response:
     return ExecuteGrasp_Response(
         success=bool(success),
         message=reason,
+        elapsed_s=float(elapsed),
+    )
+
+
+@piper_moveit.mcp("robonix/service/manipulation/reset")
+def reset(_req: Reset_Request) -> Reset_Response:
+    """Reset the manipulation state machine + park the arm at init.
+
+    Used by Stage 6 pick_skill at the start of every pick() so the
+    cpp moveit_control_node_yolo's sticky state flags (is_busy_,
+    need_to_adjust_gripper_, need_to_return_init_pose_) are
+    guaranteed clean — upstream's design assumes one grasp per
+    process lifetime, so without an explicit reset the cpp would
+    silently ignore the second pick.
+
+    Idempotent: calling twice in a row is identical to once. Safe
+    when the arm is already idle (just re-parks it at init, ~1-3s).
+
+    Returns success=True iff:
+      * the cpp's /moveit_control/reset Trigger service responded
+      * its response.success was True (state cleared AND
+        moveArmtoInit() succeeded).
+    """
+    with _state_lock:
+        if not _initialized:
+            return Reset_Response(
+                success=False,
+                message="piper_moveit not initialized",
+                elapsed_s=0.0,
+            )
+        client = _reset_client
+        if client is None:
+            return Reset_Response(
+                success=False,
+                message="rclpy bridge not ready (race? retry after 1s)",
+                elapsed_s=0.0,
+            )
+
+    from std_srvs.srv import Trigger  # noqa: E402
+
+    t0 = time.monotonic()
+    # Wait briefly for the cpp service to be advertised. Don't block
+    # forever — if the cpp node hasn't started or has crashed, fail
+    # fast with a clear message rather than hanging the MCP call.
+    if not client.wait_for_service(timeout_sec=2.0):
+        return Reset_Response(
+            success=False,
+            message=("/moveit_control/reset not advertised — "
+                     "is the cpp moveit_control_node_yolo alive?"),
+            elapsed_s=float(time.monotonic() - t0),
+        )
+
+    log.info("calling /moveit_control/reset on cpp moveit_control_node_yolo")
+    fut = client.call_async(Trigger.Request())
+
+    # Block up to 30s. moveArmtoInit() is the long pole here — it
+    # plans and executes a joint-space move back to the init pose,
+    # which can take 1-3s on a clear path or longer if the planner
+    # has to think hard. 30s gives plenty of margin without leaving
+    # the LLM-facing MCP call hanging indefinitely if the cpp node
+    # is wedged.
+    deadline = time.monotonic() + 30.0
+    while not fut.done() and time.monotonic() < deadline:
+        if _ros_stop_evt.is_set():
+            return Reset_Response(
+                success=False,
+                message="shutdown in progress",
+                elapsed_s=float(time.monotonic() - t0),
+            )
+        time.sleep(0.05)
+
+    elapsed = time.monotonic() - t0
+    if not fut.done():
+        return Reset_Response(
+            success=False,
+            message=f"/moveit_control/reset timed out after {elapsed:.1f}s",
+            elapsed_s=float(elapsed),
+        )
+
+    try:
+        resp = fut.result()
+    except Exception as e:  # noqa: BLE001
+        return Reset_Response(
+            success=False,
+            message=f"/moveit_control/reset call raised: {e}",
+            elapsed_s=float(elapsed),
+        )
+
+    log.info("reset result: success=%s msg=%r elapsed=%.2fs",
+             resp.success, resp.message, elapsed)
+    return Reset_Response(
+        success=bool(resp.success),
+        message=str(resp.message),
         elapsed_s=float(elapsed),
     )
 

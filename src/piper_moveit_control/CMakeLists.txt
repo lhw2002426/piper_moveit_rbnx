@@ -16,6 +16,7 @@ find_package(trajectory_msgs REQUIRED)
 find_package(graspnet_msgs REQUIRED)
 
 find_package(std_msgs REQUIRED)
+find_package(std_srvs REQUIRED)
 
 # MoveIt control node
 add_executable(moveit_control_node src/moveit_control_node.cpp)
@@ -50,6 +51,7 @@ ament_target_dependencies(
   "trajectory_msgs"
   "graspnet_msgs"
   "std_msgs"
+  "std_srvs"
 )
 
 # Test control node

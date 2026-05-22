@@ -12,6 +12,7 @@
 #include <tf2_geometry_msgs/tf2_geometry_msgs.hpp>
 #include "graspnet_msgs/msg/grasp_pose.hpp"
 #include <std_msgs/msg/bool.hpp>
+#include <std_srvs/srv/trigger.hpp>
 
 using FollowJointTrajectory = control_msgs::action::FollowJointTrajectory;
 using GoalHandleFollowJointTrajectory = rclcpp_action::ClientGoalHandle<FollowJointTrajectory>;
@@ -78,9 +79,9 @@ public:
     qos.durability_volatile();  // Don't keep messages for late joiners
     
     subscription_ = this->create_subscription<graspnet_msgs::msg::GraspPose>(
-        "/yolo/grasps", qos,
+        "/graspnet/grasps", qos,
         std::bind(&MoveItControlNode::targetPoseCallback, this, std::placeholders::_1));
-    
+
     joint_state_sub_ = this->create_subscription<sensor_msgs::msg::JointState>(
       "/arm/joint_states_single", qos,
       std::bind(&MoveItControlNode::jointStateCallback, this, std::placeholders::_1));
@@ -88,6 +89,35 @@ public:
     stop_signal_sub_ = this->create_subscription<std_msgs::msg::Bool>(
       "/arm/stop_signal", qos,
       std::bind(&MoveItControlNode::stopSignalCallback, this, std::placeholders::_1));
+
+    // /moveit_control/reset — std_srvs/srv/Trigger.
+    //
+    // The grasp state machine in this node has three sticky flags
+    // (is_busy_, need_to_adjust_gripper_, need_to_return_init_pose_)
+    // that are intentionally NOT reset on completion of a successful
+    // grasp — upstream's design assumed one grasp per process
+    // lifetime, with the caller restarting the node between picks.
+    //
+    // Robonix doesn't restart packages between MCP calls, so we
+    // expose an explicit reset RPC. piper_moveit_rbnx's MCP
+    // `reset` capability calls this service; pick_skill_rbnx in turn
+    // calls reset at the start of every pick() so the state machine
+    // is guaranteed clean even if a previous pick crashed mid-grasp.
+    //
+    // Reset semantics:
+    //   1. Drop all sticky flags (is_busy_, need_to_adjust_gripper_,
+    //      need_to_return_init_pose_).
+    //   2. Open the gripper to a wide neutral width.
+    //   3. Move the arm back to the joint-space init pose
+    //      (moveArmtoInit), so the next grasp starts from a known
+    //      configuration. This blocks while planning + execution
+    //      finish, so the Trigger response only succeeds once the
+    //      arm is actually parked.
+    reset_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "/moveit_control/reset",
+      std::bind(&MoveItControlNode::resetCallback, this,
+                std::placeholders::_1, std::placeholders::_2));
+    RCLCPP_INFO(this->get_logger(), "Reset service ready: /moveit_control/reset");
 
     RCLCPP_INFO(this->get_logger(), "Subscribed to /graspnet/grasps topic");
     RCLCPP_INFO(this->get_logger(), "MoveIt Control Node initialized and ready");
@@ -162,6 +192,63 @@ private:
       RCLCPP_ERROR(this->get_logger(), "Failed to plan or execute arm motion");
       is_busy_ = false;
     }
+  }
+
+  // /moveit_control/reset handler.
+  //
+  // Drops all sticky flags + parks the arm at the init pose. Returns
+  // success=true once the arm has actually finished moving. If the
+  // current state has a grasp mid-flight (busy + active execution),
+  // we still set busy=false at the END so the next caller can fire
+  // immediately, but we ALSO let the in-flight motion complete first
+  // by waiting on the moveArmtoInit() blocking call.
+  //
+  // NOTE: we don't preempt an in-flight MoveGroup execution here —
+  // MoveGroupInterface's cancel API is racy and the upstream design
+  // never tested it. If a caller really wants to abort mid-grasp,
+  // publish to /arm/stop_signal first (which already triggers
+  // moveArmtoInit() through stopSignalCallback) and THEN call reset.
+  void resetCallback(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "Reset requested: clearing state machine + parking arm");
+    // Drop all flags up front. Even if moveArmtoInit() fails below,
+    // the next grasp command should be acceptable — it's safer than
+    // staying stuck in is_busy_=true forever.
+    is_busy_ = false;
+    need_to_adjust_gripper_ = false;
+    need_to_return_init_pose_ = false;
+
+    // Open gripper to a neutral wide width before parking, in case
+    // the arm is currently holding something (gripper close on init
+    // would otherwise crush whatever's in the jaws).
+    try {
+      controlGripper(0.025f);
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(this->get_logger(), "controlGripper(0.025) threw: %s", e.what());
+    }
+
+    bool init_ok = false;
+    try {
+      init_ok = moveArmtoInit();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(), "moveArmtoInit() threw: %s", e.what());
+    }
+
+    if (init_ok) {
+      resp->success = true;
+      resp->message = "reset complete; arm parked at init";
+    } else {
+      // Even on failure we keep is_busy_=false so the caller is at
+      // least not LOCKED OUT forever — but tell them the arm isn't
+      // parked.
+      resp->success = false;
+      resp->message = "state flags cleared but moveArmtoInit() failed";
+    }
+    RCLCPP_INFO(this->get_logger(), "Reset done: %s",
+                resp->message.c_str());
   }
 
   bool adjust_grapper()
@@ -533,6 +620,8 @@ private:
   rclcpp::Subscription<sensor_msgs::msg::JointState>::SharedPtr joint_state_sub_;
 
   rclcpp::Subscription<std_msgs::msg::Bool>::SharedPtr stop_signal_sub_;
+
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
 
   // TF2
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;

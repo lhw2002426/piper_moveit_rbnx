@@ -1,0 +1,28 @@
+# Reset the manipulation state machine inside the C++ moveit_control
+# node. Used by Stage 6 pick_skill to ensure each pick() starts from a
+# known clean state, and as a recovery hook when a previous grasp got
+# stuck mid-motion.
+#
+# Schema is intentionally minimal — no inputs, just a status response
+# (mirroring std_srvs/srv/Trigger which the C++ side actually
+# implements). Keeping the codegen dataclass non-empty so the MCP
+# router doesn't trip over a 0-field request.
+
+# Request
+
+# (no fields — just a marker; codegen needs at least one to generate
+#  a Request dataclass with a default constructor.)
+bool ack
+---
+# Response
+
+# Whether the reset completed (state flags cleared AND arm parked
+# at init). false on partial reset.
+bool success
+
+# Status / error message.
+string message
+
+# Wall-clock seconds the reset took (mostly the moveArmtoInit
+# time — typically 1-3s depending on starting pose).
+float32 elapsed_s

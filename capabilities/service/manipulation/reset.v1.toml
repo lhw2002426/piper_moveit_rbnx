@@ -1,0 +1,25 @@
+# Reset the manipulation state machine + park the arm at init pose.
+# Used by Stage 6 pick_skill at the start of every pick() so the C++
+# moveit_control state machine doesn't carry over sticky busy /
+# need_to_return_init_pose flags from a previous grasp.
+#
+# Internally this calls the cpp's /moveit_control/reset
+# (std_srvs/srv/Trigger) ROS service. The MCP front door is just a
+# typed wrapper that gives Pilot a clean atlas-resolved entrypoint.
+#
+# Idempotent — calling reset twice in a row is identical to once.
+# Safe to call when the arm is idle (no-op except for the
+# moveArmtoInit() trip).
+#
+# IDL: lib/manipulation/srv/Reset.srv (package-local).
+[contract]
+id      = "robonix/service/manipulation/reset"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/Reset.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true

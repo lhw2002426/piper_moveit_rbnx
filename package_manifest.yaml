@@ -62,3 +62,4 @@ start: bash scripts/start.sh
 capabilities:
   - name: robonix/service/manipulation/driver
   - name: robonix/service/manipulation/execute_grasp
+  - name: robonix/service/manipulation/reset

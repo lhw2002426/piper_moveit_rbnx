@@ -1,14 +1,39 @@
-sensors:
-  - depth_camera
-depth_camera:
-  sensor_plugin: occupancy_map_monitor/DepthImageOctomapUpdater
-  image_topic: /camera/no_depth/image_raw
-  camera_info_topic: /camera/no_depth/camera_info
-  queue_size: 5
-  max_update_rate: 5.0
-  near_clipping_plane_distance: 0.3
-  far_clipping_plane_distance: 5.0
-  shadow_threshold: 0.2
-  padding_scale: 4.0
-  padding_offset: 0.03
-  filtered_cloud_topic: filtered_cloud
+# rbnx grasp deploy: 3D sensors disabled.
+#
+# Upstream piper_with_gripper_moveit ships a `depth_camera` sensor
+# entry that loads `occupancy_map_monitor/DepthImageOctomapUpdater`
+# inside move_group. That plugin internally uses freeglut/OpenGL to
+# do GPU-side depth-image -> octomap voxelisation, which requires a
+# valid X DISPLAY. On a headless deploy host (DISPLAY="") move_group
+# crashes hard with:
+#
+#   freeglut failed to open display ''
+#   process has died [pid <move_group>, exit code 1]
+#
+# Our grasp pipeline does NOT use the planning scene's octomap:
+#   * yolo_world_rbnx + yolo_grasp_rbnx compute the grasp pose
+#     directly from the RGBD point cloud.
+#   * moveit_control_node_yolo plans + executes the trajectory via
+#     MoveGroupInterface using the URDF + SRDF only — no
+#     occupancy_map_monitor calls.
+#
+# So we ship sensors_3d.yaml with an empty sensors list, which makes
+# MoveItConfigsBuilder skip occupancy_map_monitor altogether. To
+# re-enable upstream behaviour, restore the depth_camera entry below.
+#
+# Restoration recipe:
+#   sensors:
+#     - depth_camera
+#   depth_camera:
+#     sensor_plugin: occupancy_map_monitor/DepthImageOctomapUpdater
+#     image_topic: /camera/no_depth/image_raw
+#     camera_info_topic: /camera/no_depth/camera_info
+#     queue_size: 5
+#     max_update_rate: 5.0
+#     near_clipping_plane_distance: 0.3
+#     far_clipping_plane_distance: 5.0
+#     shadow_threshold: 0.2
+#     padding_scale: 4.0
+#     padding_offset: 0.03
+#     filtered_cloud_topic: filtered_cloud
+sensors: []

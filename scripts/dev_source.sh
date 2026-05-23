@@ -81,4 +81,31 @@ if ROBONIX_API="$(rbnx path robonix-api 2>/dev/null)"; then
     _prepend_unique PYTHONPATH "$ROBONIX_API"
 fi
 
+# External rbnx-package dependency: piper_description.
+# Same resolution chain as scripts/start.sh's _find_piper_description_prefix.
+_pdesc=""
+if [[ -n "${PIPER_DESCRIPTION_RBNX_PREFIX:-}" ]]; then
+    _pdesc="$PIPER_DESCRIPTION_RBNX_PREFIX"
+elif [[ -d "$PKG/../piper_description/rbnx-build/ws/install/piper_description/share" ]]; then
+    _pdesc="$( cd "$PKG/../piper_description/rbnx-build/ws/install/piper_description" && pwd )"
+elif [[ -d "$PKG/../piper_description_rbnx/rbnx-build/ws/install/piper_description/share" ]]; then
+    _pdesc="$( cd "$PKG/../piper_description_rbnx/rbnx-build/ws/install/piper_description" && pwd )"
+fi
+if [[ -n "$_pdesc" && -d "$_pdesc/share" ]]; then
+    _prepend_unique AMENT_PREFIX_PATH "$_pdesc"
+    _prepend_unique CMAKE_PREFIX_PATH "$_pdesc"
+    for _site in \
+        "$_pdesc"/local/lib/python*/dist-packages \
+        "$_pdesc"/lib/python*/site-packages \
+        "$_pdesc"/lib/python*/dist-packages
+    do
+        [[ -d "$_site" ]] && _prepend_unique PYTHONPATH "$_site"
+    done
+    for _libdir in "$_pdesc"/lib "$_pdesc"/local/lib; do
+        [[ -d "$_libdir" ]] && _prepend_unique LD_LIBRARY_PATH "$_libdir"
+    done
+    unset _site _libdir
+fi
+unset _pdesc
+
 unset OVERLAY_INSTALL PKG _PIPER_MOVEIT_DEV_SOURCING_IN_PROGRESS

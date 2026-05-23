@@ -100,6 +100,86 @@ if [[ -d "$OVERLAY_INSTALL" ]]; then
     unset _prefix _site _libdir
 fi
 
+# ── External rbnx-package overlays (cross-package dependencies) ─────────────
+# piper_with_gripper_moveit's xacro `<xacro:include
+# filename="$(find piper_description)/urdf/piper_description.xacro" />`
+# means the moveit launch tree NEEDS the `piper_description` ament
+# package on AMENT_PREFIX_PATH at runtime. But piper_description lives
+# in a SIBLING rbnx package (com.robonix.piper_grasp.piper_description),
+# whose colcon install root is independent of ours. We pull it in
+# explicitly here.
+#
+# Resolution order:
+#   1. PIPER_DESCRIPTION_RBNX_PREFIX env override
+#   2. ros2 pkg prefix (already on ament index — operator pre-sourced)
+#   3. sibling boot cache directory (rbnx boot's standard layout puts
+#      every package under <boot>/cache/<pkg>/, so ../piper_description
+#      from our $PKG hits the sibling)
+#   4. dev layout — ../piper_description_rbnx alongside our source tree
+_inject_prefix() {
+    local prefix="$1"
+    [[ -d "$prefix/share" ]] || return 1
+    _prepend_unique AMENT_PREFIX_PATH "$prefix"
+    _prepend_unique CMAKE_PREFIX_PATH "$prefix"
+    for _site in \
+        "$prefix"/local/lib/python*/dist-packages \
+        "$prefix"/lib/python*/site-packages \
+        "$prefix"/lib/python*/dist-packages
+    do
+        [[ -d "$_site" ]] && _prepend_unique PYTHONPATH "$_site"
+    done
+    for _libdir in "$prefix"/lib "$prefix"/local/lib; do
+        [[ -d "$_libdir" ]] && _prepend_unique LD_LIBRARY_PATH "$_libdir"
+    done
+    unset _site _libdir
+    return 0
+}
+
+_find_piper_description_prefix() {
+    # 1. explicit env override
+    if [[ -n "${PIPER_DESCRIPTION_RBNX_PREFIX:-}" ]]; then
+        echo "${PIPER_DESCRIPTION_RBNX_PREFIX}"
+        return 0
+    fi
+    # 2. already on ament index (e.g. operator pre-sourced)
+    local p
+    if p=$(ros2 pkg prefix piper_description 2>/dev/null); then
+        echo "$p"
+        return 0
+    fi
+    # 3. sibling boot cache: rbnx-boot puts each package at
+    #    <boot>/cache/<short_name>/; we're piper_moveit, the
+    #    sibling is piper_description.
+    local sibling="$PKG/../piper_description/rbnx-build/ws/install/piper_description"
+    if [[ -d "$sibling/share" ]]; then
+        ( cd "$sibling" && pwd )
+        return 0
+    fi
+    # 4. dev layout: $PKG = .../packages/piper_moveit_rbnx, sibling =
+    #    .../packages/piper_description_rbnx
+    local dev="$PKG/../piper_description_rbnx/rbnx-build/ws/install/piper_description"
+    if [[ -d "$dev/share" ]]; then
+        ( cd "$dev" && pwd )
+        return 0
+    fi
+    return 1
+}
+
+if PIPER_DESC_PREFIX="$(_find_piper_description_prefix)"; then
+    if _inject_prefix "$PIPER_DESC_PREFIX"; then
+        echo "[piper_moveit/start] using piper_description prefix: $PIPER_DESC_PREFIX" >&2
+    else
+        echo "[piper_moveit/start] WARN: piper_description prefix candidate \
+$PIPER_DESC_PREFIX has no share/ — skipping" >&2
+    fi
+    unset PIPER_DESC_PREFIX
+else
+    echo "[piper_moveit/start] WARN: piper_description not found on any \
+search path; piper_with_gripper_moveit's xacro will fail to resolve \
+'\$(find piper_description)'. Set PIPER_DESCRIPTION_RBNX_PREFIX or \
+ensure com.robonix.piper_grasp.piper_description is built and live." >&2
+fi
+
 # Quick smoke check: the two msg packages our rclpy bridge imports.
 if ! python3 -c "import graspnet_msgs.msg, piper_msgs.msg" 2>/dev/null; then
     echo "[piper_moveit/start] FATAL: graspnet_msgs.msg or piper_msgs.msg not importable" >&2
@@ -112,15 +192,19 @@ if ! python3 -c "import graspnet_msgs.msg, piper_msgs.msg" 2>/dev/null; then
     exit 3
 fi
 
-# Also verify the moveit launch package is on AMENT_PREFIX_PATH —
-# without it, `ros2 launch piper_moveit_rbnx.launch.py` blows up with
+# Also verify the moveit launch package + its xacro dep
+# (piper_description) are on AMENT_PREFIX_PATH — without these,
+# `ros2 launch piper_moveit_rbnx.launch.py` blows up with
 # PackageNotFoundError before we ever see a useful log.
-if ! ros2 pkg prefix piper_with_gripper_moveit >/dev/null 2>&1; then
-    echo "[piper_moveit/start] FATAL: piper_with_gripper_moveit not on ament index" >&2
-    echo "[piper_moveit/start] AMENT_PREFIX_PATH:" >&2
-    printf '  %s\n' ${AMENT_PREFIX_PATH//:/ } >&2
-    exit 4
-fi
+for _need in piper_with_gripper_moveit piper_description; do
+    if ! ros2 pkg prefix "$_need" >/dev/null 2>&1; then
+        echo "[piper_moveit/start] FATAL: $_need not on ament index" >&2
+        echo "[piper_moveit/start] AMENT_PREFIX_PATH:" >&2
+        printf '  %s\n' ${AMENT_PREFIX_PATH//:/ } >&2
+        exit 4
+    fi
+done
+unset _need
 
 CODEGEN_PROTO="$PKG/rbnx-build/codegen/proto_gen"
 CODEGEN_MCP="$PKG/rbnx-build/codegen/robonix_mcp_types"

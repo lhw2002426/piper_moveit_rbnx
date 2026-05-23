@@ -206,8 +206,18 @@ def generate_launch_description():
         default_value="/gripper_controller/follow_joint_trajectory",
         description="Action name for gripper FollowJointTrajectory"))
     ld.add_action(DeclareLaunchArgument(
-        "end_effector_link", default_value="arm/link6",
-        description="EE link in the prefixed TF tree"))
+        "end_effector_link", default_value="link6",
+        description=(
+            "End effector link name as it appears in the URDF/SRDF "
+            "robot model. MUST match the URDF link name (e.g. 'link6'), "
+            "NOT the prefixed TF frame name (e.g. 'arm/link6'). MoveIt's "
+            "PositionConstraint / OrientationConstraint look this up in "
+            "the kinematic model — using the prefixed TF name causes "
+            "'Link arm/link6 not found in model piper' + 'Unable to "
+            "construct goal representation' + 'Catastrophic failure' "
+            "during plan(). Upstream piper_ros's "
+            "piper_moveit_control/launch/moveit_control.launch.py also "
+            "uses 'link6' (verified against the working version)."),))
 
     moveit_control_node_yolo = Node(
         package="piper_moveit_control",

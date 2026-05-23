@@ -10,10 +10,12 @@ which IS the version known to work):
 
   * `move_group` `joint_states` remap target switched from
     `/arm/joint_states` → `/arm/joint_states_single`. This is what
-    piper_ctl_rbnx actually publishes (verified
-    piper_ctrl_single_node.py:43); the upstream's `/arm/joint_states`
-    is what the fake `ros2_control_node` writes back, but we want
-    move_group to listen to the REAL hardware feedback.
+    piper_ctl_rbnx actually publishes for FEEDBACK
+    (piper_ctrl_single_node.py:43). The default upstream target
+    `/arm/joint_states` is the COMMAND topic that piper_ctl_rbnx
+    subscribes to to drive the hardware (see file's other comments).
+    Mixing them up makes move_group plan against the fake controller's
+    cmd echo instead of the real joint feedback.
 
   * Adds an additional static_transform_publisher
     `link6 → arm/link6` (identity), to bridge our two TF subtrees:
@@ -31,55 +33,62 @@ which IS the version known to work):
     (which, by URDF + MoveIt+frame_prefix, are physically the same
     rigid body).
 
-KEY DECISION — KEEP the fake `ros2_control_node` + spawn_controllers
+CRITICAL — KEEP the fake `ros2_control_node` + spawn_controllers
 =====================================================================
-Earlier iterations of this file tried to drop these two on the theory
-that they would clash with piper_ctl_rbnx's real hardware publisher.
-That's wrong, and it broke trajectory execution with:
+Earlier iterations dropped these on the theory that they would clash
+with piper_ctl_rbnx. That's wrong twice over:
 
-    [move_group] Action client not connected to action server:
-                 arm_controller/follow_joint_trajectory
-    [move_group] Failed to send trajectory part 1 of 1 to controller
-                 arm_controller
+  (a) MoveIt SimpleControllerManager (config/moveit_controllers.yaml)
+      requires arm_controller's follow_joint_trajectory action server
+      to exist; without it MoveGroupInterface::execute() bails with
+      'Action client not connected'.
 
-Why we need them:
+  (b) MORE IMPORTANTLY: the fake controller is the ONLY data path
+      that actually drives the arm. Topology:
 
-  * MoveIt's SimpleControllerManager (configured in
-    config/moveit_controllers.yaml) expects two FollowJointTrajectory
-    action servers named `arm_controller/follow_joint_trajectory` and
-    `gripper_controller/follow_joint_trajectory`. These are advertised
-    by ros2_control's joint_trajectory_controller (spawned by
-    spawn_controllers), running on top of the
-    `mock_components/GenericSystem` plugin defined in
-    `piper.ros2_control.xacro`.
+        moveit_control_node_yolo
+            └─ MoveGroupInterface::execute(plan)
+                 └─ SimpleControllerManager → arm_controller's
+                    follow_joint_trajectory action
+                        └─ joint_trajectory_controller writes
+                           commanded joint angles into the mock
+                           GenericSystem hardware
+                                └─ joint_state_broadcaster publishes
+                                   those angles on /joint_states
+                                        └─ REMAPPED to /arm/joint_states
+                                           └─ piper_ctl_rbnx's
+                                              joint_callback subscribes
+                                              to /arm/joint_states,
+                                              converts to motor
+                                              commands over CAN
+                                                  └─ THE ARM MOVES.
 
-  * The C++ moveit_control_node_yolo calls
-    MoveGroupInterface::execute() — that internally goes through
-    SimpleControllerManager → arm_controller's follow_joint_trajectory
-    action. Without the fake controllers, execute() fails immediately.
+      So the fake controller is NOT decorative. It IS the bridge from
+      MoveIt to piper_ctl_rbnx.
 
-  * The fake controllers do NOT touch the real hardware. The flow is:
-      1. moveit_control_node_yolo plans + executes via MoveGroupInterface.
-      2. MoveGroupInterface sends the trajectory to arm_controller's
-         FollowJointTrajectory action (the fake one).
-      3. The fake controller "runs" the trajectory in its mock joint
-         model and writes joint feedback to /joint_states.
-      4. (Separately) moveit_control_node_yolo's pose-publishing logic
-         pushes commands to piper_ctl through the existing pos_cmd /
-         joint_ctrl pathway, which is what actually moves the arm.
+  Topic legend:
+      /arm/joint_states         — COMMAND topic. fake controller writes
+                                  cmd; piper_ctl reads + drives hardware.
+      /arm/joint_states_single  — FEEDBACK topic. piper_ctl writes live
+                                  joint angles; move_group reads as the
+                                  starting state for planning.
+      Two distinct topics, different roles, no clash.
 
-  * Topic isolation: the fake controller writes joint state to a
-    dedicated topic `/piper_moveit_rbnx/fake_joint_states` (remap
-    below). It is NOT remapped to /arm/joint_states_single — that
-    would let fake (zero) joint feedback overwrite real hardware
-    feedback. move_group is configured to subscribe to
-    /arm/joint_states_single (the real hardware publisher), so the
-    fake's writes never reach planning.
+  Symptoms of getting this wrong (observed in the field):
+   * Drop fake controller entirely
+       → MoveGroupInterface::execute() fails: 'Action client not
+         connected to action server: arm_controller/follow_joint_trajectory'.
+   * Keep fake controller but remap joint_states to /piper_moveit_rbnx/
+     fake_joint_states (an isolated sink)
+       → execute() reports SUCCESS but the arm never physically moves
+         (no one's listening to the sink topic to drive CAN).
+   * Keep fake controller, remap to /arm/joint_states (current setup)
+       → arm physically moves on every plan + execute. Correct.
 
-This mirrors EXACTLY what upstream piper_moveit.launch.py does
-(piper_ros/src/piper_moveit/piper_with_gripper_moveit/launch/
-piper_moveit.launch.py), with the joint_states subscription target
-swapped to the real-hardware topic.
+  This mirrors EXACTLY what upstream piper_moveit.launch.py does
+  (grasp/driver/piper_ros/.../piper_moveit.launch.py:56-61), with
+  RViz removed and the planning-state subscription target swapped
+  to the feedback topic.
 
 Default launch args mirror upstream where possible.
 """
@@ -130,11 +139,42 @@ def generate_launch_description():
     _generate_move_group_launch(ld, moveit_config)
 
     # ── 5. fake ros2_control_node + spawn_controllers ───────────────────────
-    # See file header for the full rationale. Short version: MoveIt's
-    # SimpleControllerManager NEEDS arm_controller's follow_joint_trajectory
-    # action server to exist or execute() fails. The mock GenericSystem
-    # provides it. Topic remap keeps the fake's joint feedback from
-    # leaking onto the real hardware's /arm/joint_states_single topic.
+    # See file header for the full rationale. Short version: this is THE
+    # bridge that actually drives the real arm. Topology:
+    #
+    #   moveit_control_node_yolo
+    #       └─ MoveGroupInterface::execute(plan)
+    #            └─ SimpleControllerManager → arm_controller's
+    #               follow_joint_trajectory action
+    #                   └─ joint_trajectory_controller writes commanded
+    #                      joint angles into mock_components/GenericSystem
+    #                          └─ joint_state_broadcaster publishes
+    #                             those angles on /joint_states
+    #                                └─ REMAPPED here to /arm/joint_states
+    #                                   └─ piper_ctl_rbnx subscribes to
+    #                                      /arm/joint_states (its
+    #                                      joint_callback), converts to
+    #                                      motor commands over CAN
+    #                                          └─ THE ARM MOVES.
+    #
+    # i.e. this remap is NOT a cosmetic isolation. It IS the data path.
+    # Earlier revs of this file remapped joint_states to a private
+    # sink topic to "isolate" the fake controller from the real
+    # publisher; that was wrong and is what made the arm look like
+    # it executed but never physically move.
+    #
+    # piper_ctl_rbnx publishes its OWN topic /arm/joint_states_single
+    # for live joint feedback (move_group subscribes to that one;
+    # see _generate_move_group_launch below). The two topics are
+    # different — no clash:
+    #
+    #     /arm/joint_states         ← fake controller writes (cmd)
+    #                                 piper_ctl reads (drives hardware)
+    #     /arm/joint_states_single  ← piper_ctl writes (feedback)
+    #                                 move_group reads (current state)
+    #
+    # Kept exactly as upstream piper_moveit.launch.py does it
+    # (grasp/driver/piper_ros/.../piper_moveit.launch.py:56-61).
     ld.add_action(Node(
         package="controller_manager",
         executable="ros2_control_node",
@@ -144,12 +184,7 @@ def generate_launch_description():
         ],
         output="screen",
         remappings=[
-            # The fake controller's joint_state_broadcaster writes
-            # /joint_states by default. We isolate it to a private topic
-            # to avoid clashing with piper_ctl_rbnx's real publisher.
-            # move_group subscribes to /arm/joint_states_single (the
-            # REAL hardware feedback), not this one.
-            ("joint_states", "/piper_moveit_rbnx/fake_joint_states"),
+            ("joint_states", "/arm/joint_states"),
         ],
     ))
 

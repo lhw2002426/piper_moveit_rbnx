@@ -3,6 +3,7 @@
 #include <chrono>
 #include <rclcpp/rclcpp.hpp>
 #include <moveit/move_group_interface/move_group_interface.h>
+#include <moveit/robot_model/robot_model.h>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <control_msgs/action/follow_joint_trajectory.hpp>
 #include <trajectory_msgs/msg/joint_trajectory.hpp>
@@ -28,10 +29,59 @@ public:
     this->declare_parameter("gripper_action_name", "/gripper_controller/follow_joint_trajectory");
     this->declare_parameter("end_effector_link", "arm/link6");
 
+    // Safety parameters — see incident report 2026-05-24 (REPORT-arm-crash.md).
+    //
+    // min_grasp_z_in_base_link_:
+    //   Lower bound on the z-coordinate of any grasp pose AFTER it has
+    //   been transformed into the arm's base_link frame. The Piper is
+    //   typically table-mounted with base_link at table level (z=0);
+    //   any commanded end-effector z below this threshold means the
+    //   arm would dive INTO the mounting surface. We refuse to plan
+    //   such a target. Default -0.05 m = 5 cm below base_link, which
+    //   gives some slack for poses near the table edge but rejects
+    //   anything genuinely "underground". Tune via ros param if your
+    //   mounting differs.
+    //
+    // tf_self_test_target_frame_ / tf_self_test_source_frame_:
+    //   Frames the start-up self-test will try to transform between.
+    //   Defaults match the camera→arm grasp-execution path
+    //   (`camera_color_optical_frame` → `arm/base_link`). If the TF
+    //   tree is broken (e.g. two unconnected sub-trees, as observed
+    //   in the deploy that combined ranger+piper), this test fails
+    //   FAST at start-up rather than waiting for the first grasp
+    //   command and silently no-op-ing.
+    //
+    // tf_self_test_timeout_s_:
+    //   How long to wait for the TF link to become available before
+    //   declaring the self-test failed. TF listeners need a few
+    //   seconds after node bring-up to receive their first batch of
+    //   static transforms.
+    this->declare_parameter("min_grasp_z_in_base_link", -0.05);
+    this->declare_parameter("tf_self_test_target_frame", std::string("arm/base_link"));
+    this->declare_parameter("tf_self_test_source_frame",
+                            std::string("camera_color_optical_frame"));
+    this->declare_parameter("tf_self_test_timeout_s", 8.0);
+
     // Get parameters
     arm_group_name_ = this->get_parameter("arm_group_name").as_string();
     gripper_action_name_ = this->get_parameter("gripper_action_name").as_string();
     end_effector_link_ = this->get_parameter("end_effector_link").as_string();
+    min_grasp_z_in_base_link_ =
+        this->get_parameter("min_grasp_z_in_base_link").as_double();
+    tf_self_test_target_frame_ =
+        this->get_parameter("tf_self_test_target_frame").as_string();
+    tf_self_test_source_frame_ =
+        this->get_parameter("tf_self_test_source_frame").as_string();
+    tf_self_test_timeout_s_ =
+        this->get_parameter("tf_self_test_timeout_s").as_double();
+
+    // Disabled-by-default safety latch. If start-up self-tests detect
+    // a fatal misconfiguration (TF tree broken, arm planning group
+    // missing, …), grasp_subscription_safe_ stays false and the
+    // GraspPose subscriber's callback bails before touching the
+    // hardware. Reset service is still allowed to run because reset
+    // is joint-space and doesn't depend on TF.
+    grasp_subscription_safe_ = false;
 
     // Initialize TF2 buffer and listener
     tf_buffer_ = std::make_shared<tf2_ros::Buffer>(this->get_clock());
@@ -123,10 +173,135 @@ public:
     RCLCPP_INFO(this->get_logger(), "MoveIt Control Node initialized and ready");
     this->controlGripper(0.12);
     this->moveArmtoInit();
+
+    // ── start-up self-tests ───────────────────────────────────────
+    // We run these AFTER the boot-time controlGripper(0.12) +
+    // moveArmtoInit() so the operator gets the same visual confirm
+    // they're used to (arm parks at init) regardless of self-test
+    // outcome. The tests gate `grasp_subscription_safe_`; if any
+    // test fails, the GraspPose callback will refuse to drive the
+    // arm even though it stays subscribed (so we don't lose log
+    // visibility into incoming grasp commands).
+    bool tf_ok = runTfSelfTest();
+    bool model_ok = runRobotModelSelfTest();
+    grasp_subscription_safe_ = tf_ok && model_ok;
+    if (!grasp_subscription_safe_) {
+      RCLCPP_FATAL(this->get_logger(),
+        "Start-up self-test FAILED (tf_ok=%d, model_ok=%d). GraspPose "
+        "callback will REFUSE to plan or execute until restart with a "
+        "fixed deploy. /moveit_control/reset is still available "
+        "(joint-space, no TF dependency).",
+        static_cast<int>(tf_ok), static_cast<int>(model_ok));
+    } else {
+      RCLCPP_INFO(this->get_logger(),
+                  "Start-up self-test PASSED — arm grasp pipeline armed");
+    }
+
     RCLCPP_INFO(this->get_logger(), "Initializing MoveIt Control Node completed");
   }
 
 private:
+  // ── start-up self-tests ───────────────────────────────────────────
+  //
+  // These ran for the first time after the 2026-05-24 incident where
+  // a TF tree split (camera frame in one tree, arm/base_link in
+  // another) caused TF transform calls inside the GraspPose callback
+  // to fail. The pre-incident catch block returned false — i.e. the
+  // arm did NOT execute a zero-pose trajectory; the actual hardware
+  // damage came from a different vector (commented-out z-offset +
+  // missing height floor). But the broken-TF path is still a known
+  // failure mode that silently no-ops every grasp until someone
+  // notices. Failing fast at start-up gives clear logs and lets a
+  // sentinel layer above (atlas / pick_skill) see the node is
+  // misconfigured before LLM picks fire.
+
+  bool runTfSelfTest()
+  {
+    // Wait up to tf_self_test_timeout_s_ for TF to know about both
+    // frames AND for a path between them to exist. canTransform()
+    // returns false instantly if either frame is unknown OR if they
+    // belong to disjoint sub-trees, so we poll on a deadline.
+    RCLCPP_INFO(this->get_logger(),
+                "TF self-test: probing %s ↔ %s for up to %.1fs",
+                tf_self_test_target_frame_.c_str(),
+                tf_self_test_source_frame_.c_str(),
+                tf_self_test_timeout_s_);
+    auto deadline = this->now() + rclcpp::Duration::from_seconds(
+                                       tf_self_test_timeout_s_);
+    std::string err;
+    while (rclcpp::ok() && this->now() < deadline) {
+      err.clear();
+      if (tf_buffer_->canTransform(
+              tf_self_test_target_frame_, tf_self_test_source_frame_,
+              tf2::TimePointZero, &err)) {
+        RCLCPP_INFO(this->get_logger(),
+                    "TF self-test PASSED (%s ↔ %s reachable)",
+                    tf_self_test_target_frame_.c_str(),
+                    tf_self_test_source_frame_.c_str());
+        return true;
+      }
+      std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
+    RCLCPP_FATAL(this->get_logger(),
+      "TF self-test FAILED: cannot transform %s ↔ %s within %.1fs. "
+      "Last reason: %s. This means the camera frame and the arm base "
+      "frame are in DISJOINT TF sub-trees (typical when frame_prefix "
+      "is used on one but not the other, or when an upstream package "
+      "publishes a parallel base_link). Grasp commands will be "
+      "refused until restart.",
+      tf_self_test_target_frame_.c_str(),
+      tf_self_test_source_frame_.c_str(),
+      tf_self_test_timeout_s_, err.c_str());
+    return false;
+  }
+
+  bool runRobotModelSelfTest()
+  {
+    // Sanity check the loaded robot model + arm planning group.
+    // Catches the SRDF-vs-URDF drift documented in the incident
+    // report (e.g. SRDF references a `gripper` joint the URDF no
+    // longer has). MoveIt logs ERRORs about that on its own but
+    // doesn't refuse to plan; we want the start-up gate to be
+    // explicit.
+    if (!move_group_interface_) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "Robot model self-test FAILED: MoveGroupInterface null");
+      return false;
+    }
+    auto robot_model = move_group_interface_->getRobotModel();
+    if (!robot_model) {
+      RCLCPP_FATAL(this->get_logger(),
+                   "Robot model self-test FAILED: getRobotModel() returned null");
+      return false;
+    }
+    auto jmg = robot_model->getJointModelGroup(arm_group_name_);
+    if (!jmg) {
+      RCLCPP_FATAL(this->get_logger(),
+        "Robot model self-test FAILED: arm planning group '%s' not found "
+        "in robot model. Check SRDF.",
+        arm_group_name_.c_str());
+      return false;
+    }
+    const auto& joints = jmg->getActiveJointModelNames();
+    if (joints.empty()) {
+      RCLCPP_FATAL(this->get_logger(),
+        "Robot model self-test FAILED: arm planning group '%s' has zero "
+        "active joints — SRDF/URDF mismatch?",
+        arm_group_name_.c_str());
+      return false;
+    }
+    std::string joint_list;
+    for (const auto& jn : joints) {
+      if (!joint_list.empty()) joint_list += ", ";
+      joint_list += jn;
+    }
+    RCLCPP_INFO(this->get_logger(),
+                "Robot model self-test PASSED — arm group '%s' has %zu "
+                "active joints: %s",
+                arm_group_name_.c_str(), joints.size(), joint_list.c_str());
+    return true;
+  }
+
   void stopSignalCallback(const std_msgs::msg::Bool::SharedPtr msg)
   {
     if (msg->data) {
@@ -152,6 +327,17 @@ private:
 
   void targetPoseCallback(const graspnet_msgs::msg::GraspPose::SharedPtr msg)
   {
+    // Safety latch — if start-up self-tests failed (broken TF tree,
+    // missing arm planning group, …), refuse to drive the arm. Stay
+    // subscribed so we still log incoming grasp commands for
+    // debugging, but do nothing.
+    if (!grasp_subscription_safe_) {
+      RCLCPP_ERROR(this->get_logger(),
+        "GraspPose received but start-up self-test failed; refusing to "
+        "execute. Restart this node after fixing TF / SRDF.");
+      return;
+    }
+
     if (is_busy_) {
       RCLCPP_WARN(this->get_logger(), "Robot is busy, ignoring new command");
       if (need_to_return_init_pose_) {
@@ -449,6 +635,30 @@ private:
       RCLCPP_ERROR(this->get_logger(), "Could not transform pose to base_link: %s", ex.what());
       return false;
     }
+    // ── height-floor safety check ─────────────────────────────────
+    // Hard reject any grasp pose whose end-effector z (in
+    // arm/base_link frame) is below min_grasp_z_in_base_link_. This
+    // is the last-line defence against drive-into-the-mounting-
+    // surface failure modes:
+    //   * yolo_grasp returning a pose whose z-component happens to
+    //     point downward into the table
+    //   * a future regression that re-introduces a missing
+    //     pre-grasp z-offset (the commented-out
+    //     "pose_in_link6.position.z -= 0.10" block above is a
+    //     reminder)
+    //   * mis-calibrated easy_handeye2 transform pulling poses below
+    //     the mounting surface
+    // We refuse BEFORE setPoseTarget(), so MoveIt never plans a
+    // dangerous trajectory and the arm stays put.
+    if (pose_in_base_link.pose.position.z < min_grasp_z_in_base_link_) {
+      RCLCPP_ERROR(this->get_logger(),
+        "REJECTED grasp pose: z=%.4f m in arm/base_link is below safety "
+        "floor %.4f m. This pose would drive the end-effector INTO the "
+        "mounting surface. Adjust min_grasp_z_in_base_link param or fix "
+        "the upstream grasp planner / hand-eye calibration.",
+        pose_in_base_link.pose.position.z, min_grasp_z_in_base_link_);
+      return false;
+    }
     // return true;//debug only
     try {
       // Set target pose
@@ -637,6 +847,13 @@ private:
   bool need_to_adjust_gripper_;
 
   bool need_to_return_init_pose_;
+
+  // Safety latch + tunables, see ctor for full rationale.
+  bool   grasp_subscription_safe_;
+  double min_grasp_z_in_base_link_;
+  std::string tf_self_test_target_frame_;
+  std::string tf_self_test_source_frame_;
+  double tf_self_test_timeout_s_;
 };
 
 int main(int argc, char* argv[])

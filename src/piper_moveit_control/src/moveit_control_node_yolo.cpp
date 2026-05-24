@@ -367,6 +367,29 @@ private:
             msg->target_pose.pose.orientation.w);
     RCLCPP_INFO(this->get_logger(), "Gripper width: %.3f m", msg->gripper_width);
 
+    // ── DEMO MODE OVERRIDE ───────────────────────────────────────
+    // Uncomment the block below to replace the real grasp pipeline
+    // with a fixed joint-space move to the DEMO pose. Useful for
+    // canned showcase runs where you want every pick.pick(...) call
+    // to land at the same hard-coded configuration regardless of
+    // what yolo_grasp computed. Keep the rest of the state machine
+    // (is_busy_ / need_to_adjust_gripper_ / reset path) intact so
+    // pick_skill's post-grasp reset still works the same way.
+    //
+    // To enable for a demo:
+    //   1. Uncomment the four lines between BEGIN/END below.
+    //   2. (Optional) edit moveArmtoDemo()'s degrees[] to the pose
+    //      you want.
+    //   3. Re-build piper_moveit_control.
+    // To disable: re-comment and rebuild.
+    //
+    // ── BEGIN demo override ──
+    // bool demo_success = moveArmtoDemo();
+    // if (demo_success) { need_to_adjust_gripper_ = true; }
+    // else { RCLCPP_ERROR(this->get_logger(), "Demo move failed"); is_busy_ = false; }
+    // return;
+    // ── END demo override ──
+
     // Control gripper
     controlGripper(msg->gripper_width);
     // Move arm to target pose
@@ -754,6 +777,30 @@ private:
 
     // auto time_now = std::chrono::high_resolution_clock::now();
     RCLCPP_INFO(this->get_logger(), "Moving arm to initial pose...");
+    return moveArmJoint(radians);
+  }
+
+  // Demo pose — fixed joint-space target used for canned demos /
+  // showcase runs. Swap the degrees[] values to whatever six joint
+  // angles you want the demo to land at; the rest of the function
+  // mirrors moveArmtoInit() exactly (degrees -> radians, joint-space
+  // plan + execute via MoveIt). All zeros is a safe placeholder
+  // (matches MoveIt's URDF default state).
+  bool moveArmtoDemo()
+  {
+    double degrees[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    const int size = sizeof(degrees) / sizeof(degrees[0]);
+
+    std::vector<double> radians;
+    radians.reserve(size);
+
+    const double pi = M_PI;
+    for (int i = 0; i < size; i++) {
+        double radian = degrees[i] * pi / 180.0;
+        radians.push_back(radian);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Moving arm to DEMO pose...");
     return moveArmJoint(radians);
   }
 

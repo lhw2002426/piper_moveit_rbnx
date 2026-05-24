@@ -1,0 +1,30 @@
+# Demo move — drive the arm to a fixed joint-space pose with the
+# gripper open. Counterpart to `manipulation/reset` for canned
+# showcase / demo runs.
+#
+# Sibling capability of manipulation/reset; same ROS-side mechanism
+# (a std_srvs/srv/Trigger inside the cpp moveit_control node) and
+# same Response shape, but the cpp side runs moveArmtoDemo() and
+# controlGripper(demo_gripper_width) instead of moveArmtoInit() +
+# controlGripper(0.025). The demo joint angles AND the gripper
+# width are baked into the cpp build (degrees[] array in
+# moveArmtoDemo, demo_gripper_width ros param). Operators tune
+# them, rebuild piper_moveit_control, and the new demo target
+# takes effect on the next deploy.
+#
+# Idempotent — calling demo twice in a row is identical to once.
+# Safe at any state of the cpp state machine; it clears the
+# sticky flags up front, same as reset.
+#
+# IDL: lib/manipulation/srv/Demo.srv (package-local).
+[contract]
+id      = "robonix/service/manipulation/demo"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/Demo.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true

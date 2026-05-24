@@ -1,0 +1,27 @@
+# Demo move — drive the arm to a fixed joint-space pose and open
+# the gripper to a wide neutral width. Used for canned showcase
+# runs where the operator wants every "pick" gesture to land at the
+# same hard-coded configuration regardless of perception output.
+#
+# Schema mirrors Reset.srv exactly:
+#   * Request has a single bool `ack` so the codegen dataclass has
+#     at least one field (FastMCP / codegen routers don't like
+#     fully-empty messages).
+#   * Response carries success / message / elapsed_s, same shape as
+#     Reset_Response, so callers can treat reset and demo
+#     interchangeably from a control-flow standpoint.
+#
+# Internally this calls the cpp's /moveit_control/demo
+# (std_srvs/srv/Trigger) ROS service. Gripper width is configured
+# inside the cpp node via the `demo_gripper_width` ros param
+# (default 0.08 m = 8 cm jaw gap), NOT through this MCP IDL —
+# that keeps the contract minimal and lets the operator tweak
+# demo behaviour without re-codegenning.
+
+# Request
+bool ack
+---
+# Response
+bool   success
+string message
+float32 elapsed_s

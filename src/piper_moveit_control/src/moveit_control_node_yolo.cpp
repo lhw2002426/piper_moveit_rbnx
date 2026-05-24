@@ -332,6 +332,15 @@ private:
   bool moveArmJoint(const std::vector<double>& joints)
   {
     try{
+      // Pin the planner's start state to the arm's CURRENT joint
+      // position. Without this, MoveGroupInterface uses whatever
+      // start state is in the planning scene's robot model — which
+      // can be stale (e.g. the default all-zero state at startup,
+      // or the previous goal if /joint_states hasn't refreshed yet).
+      // The visible symptom of a stale start state: a "joint" plan
+      // that mysteriously detours through joint=0 before reaching
+      // the actual goal, because that's the assumed starting point.
+      move_group_interface_->setStartStateToCurrentState();
       move_group_interface_->setJointValueTarget(joints);
 
       // Plan
@@ -451,6 +460,11 @@ private:
     }
     // return true;//debug only
     try {
+      // Pin the planner's start state to the arm's current joint
+      // position; same rationale as moveArmJoint(). Without this
+      // the cartesian planner can pick a wildly suboptimal IK
+      // solution that "starts" from a stale assumed pose.
+      move_group_interface_->setStartStateToCurrentState();
       // Set target pose
       move_group_interface_->setPoseTarget(pose_in_base_link);
 

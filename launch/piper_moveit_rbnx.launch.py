@@ -8,15 +8,6 @@ which IS the version known to work):
     `ros2 launch piper_with_gripper_moveit moveit_rviz.launch.py`
     in another shell if visualisation needed.
 
-  * `move_group` `joint_states` remap target switched from
-    `/arm/joint_states` → `/arm/joint_states_single`. This is what
-    piper_ctl_rbnx actually publishes for FEEDBACK
-    (piper_ctrl_single_node.py:43). The default upstream target
-    `/arm/joint_states` is the COMMAND topic that piper_ctl_rbnx
-    subscribes to to drive the hardware (see file's other comments).
-    Mixing them up makes move_group plan against the fake controller's
-    cmd echo instead of the real joint feedback.
-
   * Adds an additional static_transform_publisher
     `link6 → arm/link6` (identity), to bridge our two TF subtrees:
       ┌─ unprefixed  (Stage 3A piper_description_rbnx publishes):
@@ -32,6 +23,21 @@ which IS the version known to work):
     static TF connects the two at the `link6 / arm/link6` join point
     (which, by URDF + MoveIt+frame_prefix, are physically the same
     rigid body).
+
+  * Spawns the cpp `moveit_control_node_yolo` here. Upstream relies
+    on the user manually running `bash run_moveit_control_yolo.sh`
+    after the launch. We can't depend on a manual second step in a
+    robonix-managed deploy, so the node is part of this launch.
+    See section 6 below.
+
+NOTE on joint_states remap (HISTORY): an earlier revision of this
+file remapped move_group's joint_states subscription to
+/arm/joint_states_single (the real-arm feedback topic published by
+piper_ctl_rbnx), reasoning that "feedback is more authoritative
+than fake-controller cmd echo". That broke the reset path:
+moveArmtoInit() planned a trajectory that detoured through joint=0.
+See `_generate_move_group_launch` docstring for the full analysis.
+We've reverted to the upstream remap target /arm/joint_states.
 
 CRITICAL — KEEP the fake `ros2_control_node` + spawn_controllers
 =====================================================================
@@ -236,9 +242,39 @@ def generate_launch_description():
 
 
 def _generate_move_group_launch(ld, moveit_config):
-    """Mirror of upstream's `my_generate_move_group_launch`, with the
-    `joint_states` remap target switched from /arm/joint_states to
-    /arm/joint_states_single (what piper_ctl_rbnx actually publishes).
+    """Mirror of upstream's `my_generate_move_group_launch`.
+
+    `joint_states` remap target: `/arm/joint_states` (the FAKE
+    controller's command echo), matching upstream
+    piper_with_gripper_moveit/launch/piper_moveit.launch.py:151.
+
+    A previous revision of this file remapped to /arm/joint_states_single
+    (the real piper_ctl FEEDBACK topic) on the theory that "feedback
+    is more authoritative than cmd echo". That broke reset path.
+    Symptom: after a successful grasp, /moveit_control/reset's
+    moveArmtoInit() planned a trajectory that visibly detoured
+    through joint=0 before reaching the init pose.
+
+    Why this happens with /arm/joint_states_single:
+      * piper_ctl publishes joint_states_single with `name` field
+        ['joint1', ..., 'joint6', 'gripper']. Whether that matches
+        what move_group's planning scene monitor expects is fragile
+        (depends on URDF + planning group composition).
+      * If the monitor rejects/misses the message, current_state
+        falls back to the URDF default — all-zero joint values.
+      * plan() then computes "all-zero → init-pose" instead of
+        "current-pose → init-pose" — exactly the observed detour.
+
+    Why /arm/joint_states works (upstream behaviour):
+      * The fake ros2_control_node publishes cmd echo on
+        /arm/joint_states with EXACTLY the joint names move_group
+        expects (from the same URDF MoveIt was configured with).
+      * After every executed trajectory, fake controller holds the
+        last commanded position and re-publishes it; the planning
+        scene monitor always has a fresh, correctly-named sample.
+      * piper_ctl_rbnx reads /arm/joint_states as its INPUT
+        (joint_callback) to drive CAN — i.e. the cmd is the ground
+        truth that gets pushed to the real arm anyway.
     """
     ld.add_action(DeclareBooleanLaunchArg("debug", default_value=False))
     ld.add_action(DeclareBooleanLaunchArg(
@@ -263,9 +299,10 @@ def _generate_move_group_launch(ld, moveit_config):
         "publish_state_updates": should_publish,
         "publish_transforms_updates": should_publish,
         "monitor_dynamics": False,
-        # Subscribe to joint_states from the real piper_ctl_rbnx
-        # publisher — see file header.
-        "joint_states_topic": "/arm/joint_states_single",
+        # See docstring above for why this is /arm/joint_states (cmd
+        # echo from the fake controller) and NOT /arm/joint_states_single
+        # (piper_ctl real-arm feedback).
+        "joint_states_topic": "/arm/joint_states",
         "planning_frame": "arm/world",
         "planning_scene_monitor": {"planning_frame": "arm/world"},
     }
@@ -289,9 +326,10 @@ def _generate_move_group_launch(ld, moveit_config):
         executable="move_group",
         name="move_group",
         output="screen",
-        parameters=move_group_params,
         remappings=[
-            ("joint_states", "/arm/joint_states_single"),
+            # Match upstream piper_moveit.launch.py:151. See docstring.
+            ("joint_states", "/arm/joint_states"),
         ],
+        parameters=move_group_params,
     )
     ld.add_action(move_group_node)

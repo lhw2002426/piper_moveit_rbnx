@@ -70,6 +70,21 @@ public:
     // hitting the 0.12 m mechanical max.
     this->declare_parameter("demo_gripper_width", 0.08);
 
+    // Closed-gripper width used at the END of a demo "pick" gesture
+    // (controlGripper(grasp_close_width) after the arm reaches the
+    // demo pose) — simulates grabbing the imaginary object so the
+    // arm visibly carries something during the full pick+place
+    // sequence. Matches the value cpp's resetCallback also uses
+    // (0.025 m = 2.5 cm).
+    this->declare_parameter("grasp_close_width", 0.025);
+
+    // /moveit_control/demo_place dwell time: how long the arm holds
+    // the demo-place pose (gripper still closed) BEFORE opening the
+    // gripper to release the imaginary object. 2 s gives an
+    // audience time to register the place gesture before the
+    // gripper visibly opens.
+    this->declare_parameter("place_open_pause_s", 2.0);
+
     // Get parameters
     arm_group_name_ = this->get_parameter("arm_group_name").as_string();
     gripper_action_name_ = this->get_parameter("gripper_action_name").as_string();
@@ -84,6 +99,10 @@ public:
         this->get_parameter("tf_self_test_timeout_s").as_double();
     demo_gripper_width_ =
         this->get_parameter("demo_gripper_width").as_double();
+    grasp_close_width_ =
+        this->get_parameter("grasp_close_width").as_double();
+    place_open_pause_s_ =
+        this->get_parameter("place_open_pause_s").as_double();
 
     // Disabled-by-default safety latch. If start-up self-tests detect
     // a fatal misconfiguration (TF tree broken, arm planning group
@@ -197,6 +216,34 @@ public:
                 std::placeholders::_1, std::placeholders::_2));
     RCLCPP_INFO(this->get_logger(), "Demo service ready: /moveit_control/demo "
                 "(gripper_width=%.3f m)", demo_gripper_width_);
+
+    // /moveit_control/demo_place — the "place" half of the canned
+    // pick-and-place demo. Drives the arm to a SECOND fixed
+    // joint-space pose (moveArmtoDemoPlace), holds for
+    // place_open_pause_s, opens the gripper to demo_gripper_width
+    // (releasing the imaginary object), then parks at init.
+    demo_place_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "/moveit_control/demo_place",
+      std::bind(&MoveItControlNode::demoPlaceCallback, this,
+                std::placeholders::_1, std::placeholders::_2));
+    RCLCPP_INFO(this->get_logger(), "DemoPlace service ready: "
+                "/moveit_control/demo_place");
+
+    // /moveit_control/full_demo — full pick + carry + place demo,
+    // chained inside cpp so an operator can trigger it via raw ROS
+    // (`ros2 service call /moveit_control/full_demo std_srvs/srv/Trigger {}`)
+    // without going through atlas / pilot / pick_skill. Sequence:
+    //   1. demo "pick"  (open → demo pose → close)
+    //   2. moveArmtoInit() with the gripper STILL closed (carry
+    //      the imaginary object back to init)
+    //   3. demo "place" (demo place pose → 2 s hold → open → init)
+    full_demo_service_ = this->create_service<std_srvs::srv::Trigger>(
+      "/moveit_control/full_demo",
+      std::bind(&MoveItControlNode::fullDemoCallback, this,
+                std::placeholders::_1, std::placeholders::_2));
+    RCLCPP_INFO(this->get_logger(), "FullDemo service ready: "
+                "/moveit_control/full_demo "
+                "(call directly via `ros2 service call` for debugging)");
 
     RCLCPP_INFO(this->get_logger(), "Subscribed to /graspnet/grasps topic");
     RCLCPP_INFO(this->get_logger(), "MoveIt Control Node initialized and ready");
@@ -468,35 +515,58 @@ private:
 
   // /moveit_control/demo handler — sibling of resetCallback().
   //
-  // Drops sticky state flags + opens gripper to demo_gripper_width_
-  // + moves the arm to the joint-space DEMO pose
-  // (moveArmtoDemo()'s degrees[] array). Returns success=true once
-  // the arm has actually finished the move.
+  // Drops sticky state flags then runs a "demo pick" gesture:
+  //   1. controlGripper(demo_gripper_width_)  [gripper opens, e.g. 0.08]
+  //   2. moveArmtoDemo()                       [joint-space → demo pose]
+  //   3. controlGripper(grasp_close_width_)    [gripper closes, e.g. 0.025]
+  // Step 3 is what makes this a "pick" rather than just a pose
+  // command — visually the gripper looks like it grabbed something
+  // at the demo pose. The same three-step sequence is reused by
+  // /moveit_control/full_demo for the first leg of the full
+  // pick + carry + place demo.
   //
-  // Exists so an operator can wire pick_skill_rbnx to call
-  // /moveit_control/demo via MCP in place of the real grasp
-  // pipeline, giving every "pick" gesture a deterministic pose for
-  // showcase runs. Doesn't preempt an in-flight grasp execution
-  // (same caveats as resetCallback — MoveGroupInterface's cancel
-  // API is racy).
+  // Returns success=true once the arm has finished the joint-space
+  // move (gripper ops are async/non-blocking so we don't gate on
+  // them). Doesn't preempt an in-flight grasp execution (same
+  // caveats as resetCallback — MoveGroupInterface's cancel API is
+  // racy).
   void demoCallback(
       const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
       std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
   {
     RCLCPP_INFO(this->get_logger(),
                 "Demo requested: clearing state machine + driving to demo pose "
-                "(gripper_width=%.3f m)", demo_gripper_width_);
-    // Same flag-cleanup as reset — even if moveArmtoDemo() fails
-    // below, leaving is_busy_=true forever would lock the node out
-    // of all subsequent commands.
+                "(open=%.3f m, close=%.3f m)",
+                demo_gripper_width_, grasp_close_width_);
     is_busy_ = false;
     need_to_adjust_gripper_ = false;
     need_to_return_init_pose_ = false;
 
-    // Open gripper FIRST, then move the arm. Same ordering as the
-    // real grasp callback (controlGripper before moveArmToPose) so
-    // the gripper has its 1s trajectory time concurrent with the
-    // arm motion planning.
+    bool ok = runDemoPick();
+
+    if (ok) {
+      resp->success = true;
+      resp->message = "demo complete; arm at demo pose, gripper closed";
+    } else {
+      resp->success = false;
+      resp->message = "state flags cleared but moveArmtoDemo() failed";
+    }
+    RCLCPP_INFO(this->get_logger(), "Demo done: %s", resp->message.c_str());
+  }
+
+  // Internal: shared "demo pick gesture" used by /moveit_control/demo
+  // and the first leg of /moveit_control/full_demo.
+  //
+  // Sequence:
+  //   1. open gripper to demo_gripper_width_  (async; ~1 s trajectory)
+  //   2. plan + execute joint-space move to DEMO pose (blocking)
+  //   3. close gripper to grasp_close_width_  (async; ~1 s trajectory)
+  //
+  // Returns whether the arm motion (step 2) succeeded. Gripper ops
+  // are async-fire-and-forget; if a gripper command fails we log
+  // a WARN but don't propagate the failure.
+  bool runDemoPick()
+  {
     try {
       controlGripper(static_cast<float>(demo_gripper_width_));
     } catch (const std::exception& e) {
@@ -513,15 +583,185 @@ private:
     }
 
     if (ok) {
-      resp->success = true;
-      resp->message = "demo complete; arm at demo pose, gripper open";
-    } else {
-      // Same is_busy_=false post-condition as on success — caller
-      // should not be locked out just because plan/execute failed.
-      resp->success = false;
-      resp->message = "state flags cleared but moveArmtoDemo() failed";
+      // Close gripper AFTER reaching demo pose to simulate grasping
+      // the (imaginary) object. controlGripper is async, so if the
+      // caller (e.g. fullDemoCallback) immediately tells the arm to
+      // move next, the gripper closes concurrently with the next
+      // arm motion — just like a real grasp pipeline.
+      try {
+        controlGripper(static_cast<float>(grasp_close_width_));
+      } catch (const std::exception& e) {
+        RCLCPP_WARN(this->get_logger(),
+                    "controlGripper(%.3f) threw: %s",
+                    grasp_close_width_, e.what());
+      }
     }
-    RCLCPP_INFO(this->get_logger(), "Demo done: %s", resp->message.c_str());
+    return ok;
+  }
+
+  // Internal: shared "demo place gesture" used by
+  // /moveit_control/demo_place and the third leg of
+  // /moveit_control/full_demo.
+  //
+  // Sequence:
+  //   1. plan + execute joint-space move to DEMO PLACE pose (blocking)
+  //   2. sleep place_open_pause_s_         (audience-readable beat)
+  //   3. open gripper to demo_gripper_width_   (release imaginary object)
+  //   4. plan + execute joint-space move back to init pose (blocking)
+  //
+  // Returns true if BOTH arm motions (steps 1 + 4) succeeded.
+  // Note: callers are expected to clear sticky state flags
+  // themselves BEFORE calling this; we don't touch is_busy_ /
+  // need_to_adjust_gripper_ here so fullDemoCallback can chain
+  // multiple legs without flag thrash.
+  bool runDemoPlace()
+  {
+    bool ok_place = false;
+    try {
+      ok_place = moveArmtoDemoPlace();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "moveArmtoDemoPlace() threw: %s", e.what());
+    }
+    if (!ok_place) {
+      return false;
+    }
+
+    // Hold the place pose for place_open_pause_s_ seconds before
+    // releasing — gives the audience time to register the place
+    // gesture before the gripper visibly opens. Use rclcpp::sleep_for
+    // (not std::this_thread::sleep_for) so it's interruptible by
+    // executor shutdown.
+    auto pause_ns = std::chrono::duration<double>(place_open_pause_s_);
+    RCLCPP_INFO(this->get_logger(),
+                "Holding demo-place pose for %.1fs before releasing gripper",
+                place_open_pause_s_);
+    std::this_thread::sleep_for(
+        std::chrono::duration_cast<std::chrono::milliseconds>(pause_ns));
+
+    try {
+      controlGripper(static_cast<float>(demo_gripper_width_));
+    } catch (const std::exception& e) {
+      RCLCPP_WARN(this->get_logger(),
+                  "controlGripper(%.3f) threw: %s",
+                  demo_gripper_width_, e.what());
+    }
+
+    bool ok_init = false;
+    try {
+      ok_init = moveArmtoInit();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "moveArmtoInit() threw: %s", e.what());
+    }
+    return ok_init;
+  }
+
+  // /moveit_control/demo_place handler — sibling of demoCallback.
+  //
+  // Runs the "place" half of a canned pick-and-place demo:
+  // demo place pose → 2 s hold → open gripper → init. Operator
+  // wires this in the same way as demo (atlas / pick_skill demo
+  // override).
+  void demoPlaceCallback(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "DemoPlace requested: clearing state machine + driving "
+                "to demo place pose (open=%.3f m, pause=%.1fs)",
+                demo_gripper_width_, place_open_pause_s_);
+    is_busy_ = false;
+    need_to_adjust_gripper_ = false;
+    need_to_return_init_pose_ = false;
+
+    bool ok = runDemoPlace();
+
+    if (ok) {
+      resp->success = true;
+      resp->message = "demo_place complete; arm parked at init, gripper open";
+    } else {
+      resp->success = false;
+      resp->message = "state flags cleared but demo_place sub-step failed";
+    }
+    RCLCPP_INFO(this->get_logger(), "DemoPlace done: %s",
+                resp->message.c_str());
+  }
+
+  // /moveit_control/full_demo handler — chained pick + carry + place.
+  //
+  // Triggerable directly via raw ROS:
+  //   ros2 service call /moveit_control/full_demo std_srvs/srv/Trigger {}
+  // No atlas / pilot / pick_skill involvement, ideal for debugging
+  // the demo poses + gripper widths in isolation.
+  //
+  // Sequence (state flags cleared once at the top, then each leg
+  // chained sequentially):
+  //   1. demo "pick"      runDemoPick()
+  //                          open gripper (0.08)
+  //                          → moveArmtoDemo()
+  //                          → close gripper (0.025)
+  //   2. carry            moveArmtoInit()           [gripper STILL closed]
+  //   3. demo "place"     runDemoPlace()
+  //                          → moveArmtoDemoPlace()
+  //                          → sleep place_open_pause_s
+  //                          → open gripper (0.08)
+  //                          → moveArmtoInit()
+  //
+  // Each leg's success is logged. If any leg fails the rest of
+  // the sequence is aborted and the response carries the failed
+  // leg's name.
+  void fullDemoCallback(
+      const std::shared_ptr<std_srvs::srv::Trigger::Request> /*req*/,
+      std::shared_ptr<std_srvs::srv::Trigger::Response> resp)
+  {
+    RCLCPP_INFO(this->get_logger(),
+                "FullDemo requested: clearing state machine + chaining "
+                "pick → carry → place");
+    is_busy_ = false;
+    need_to_adjust_gripper_ = false;
+    need_to_return_init_pose_ = false;
+
+    // Leg 1: demo pick (open → demo pose → close).
+    if (!runDemoPick()) {
+      resp->success = false;
+      resp->message = "full_demo failed at leg 1 (demo pick)";
+      RCLCPP_ERROR(this->get_logger(), "%s", resp->message.c_str());
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(), "FullDemo leg 1 (pick) ok");
+
+    // Leg 2: carry — return to init with gripper STILL closed.
+    // Don't touch the gripper here; runDemoPick already closed it
+    // and we want to visibly carry the imaginary object back.
+    bool ok_carry = false;
+    try {
+      ok_carry = moveArmtoInit();
+    } catch (const std::exception& e) {
+      RCLCPP_ERROR(this->get_logger(),
+                   "moveArmtoInit() threw: %s", e.what());
+    }
+    if (!ok_carry) {
+      resp->success = false;
+      resp->message = "full_demo failed at leg 2 (carry to init)";
+      RCLCPP_ERROR(this->get_logger(), "%s", resp->message.c_str());
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(), "FullDemo leg 2 (carry) ok");
+
+    // Leg 3: demo place (place pose → 2 s hold → open → init).
+    if (!runDemoPlace()) {
+      resp->success = false;
+      resp->message = "full_demo failed at leg 3 (demo place)";
+      RCLCPP_ERROR(this->get_logger(), "%s", resp->message.c_str());
+      return;
+    }
+    RCLCPP_INFO(this->get_logger(), "FullDemo leg 3 (place) ok");
+
+    resp->success = true;
+    resp->message = "full_demo complete (pick → carry → place)";
+    RCLCPP_INFO(this->get_logger(), "FullDemo done: %s",
+                resp->message.c_str());
   }
 
   bool adjust_grapper()
@@ -868,6 +1108,28 @@ private:
     return moveArmJoint(radians);
   }
 
+  // Demo PLACE pose — second fixed joint-space target used for
+  // canned demos. Same pattern as moveArmtoDemo. Default value all
+  // zeros (placeholder) — operator edits the degrees[] array to
+  // wherever the demo "place" gesture should land and rebuilds.
+  bool moveArmtoDemoPlace()
+  {
+    double degrees[] = {0.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+    const int size = sizeof(degrees) / sizeof(degrees[0]);
+
+    std::vector<double> radians;
+    radians.reserve(size);
+
+    const double pi = M_PI;
+    for (int i = 0; i < size; i++) {
+        double radian = degrees[i] * pi / 180.0;
+        radians.push_back(radian);
+    }
+
+    RCLCPP_INFO(this->get_logger(), "Moving arm to DEMO PLACE pose...");
+    return moveArmJoint(radians);
+  }
+
   void controlGripper(float width)
   {
     // Clamp width to valid range
@@ -944,6 +1206,8 @@ private:
 
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr reset_service_;
   rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr demo_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr demo_place_service_;
+  rclcpp::Service<std_srvs::srv::Trigger>::SharedPtr full_demo_service_;
 
   // TF2
   std::shared_ptr<tf2_ros::Buffer> tf_buffer_;
@@ -967,6 +1231,8 @@ private:
   std::string tf_self_test_source_frame_;
   double tf_self_test_timeout_s_;
   double demo_gripper_width_;
+  double grasp_close_width_;
+  double place_open_pause_s_;
 };
 
 int main(int argc, char* argv[])

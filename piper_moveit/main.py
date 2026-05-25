@@ -85,6 +85,7 @@ _ros_stop_evt = threading.Event()
 _grasps_pub = None              # /graspnet/grasps publisher
 _reset_client = None            # /moveit_control/reset Trigger client
 _demo_client = None             # /moveit_control/demo Trigger client
+_demo_place_client = None       # /moveit_control/demo_place Trigger client
 _arm_status_lock = threading.Lock()
 _last_arm_status_value: Optional[int] = None      # PiperStatusMsg.arm_status
 _last_arm_status_stamp: float = 0.0               # monotonic ts
@@ -171,7 +172,7 @@ def _ros_thread_main() -> None:
       * publisher  /graspnet/grasps      (graspnet_msgs/msg/GraspPose)
       * subscriber /arm/arm_status       (piper_msgs/msg/PiperStatusMsg)
     """
-    global _ros_node, _grasps_pub, _reset_client, _demo_client, _last_arm_status_value, _last_arm_status_stamp
+    global _ros_node, _grasps_pub, _reset_client, _demo_client, _demo_place_client, _last_arm_status_value, _last_arm_status_stamp
 
     import rclpy                                              # noqa: E402
     from rclpy.node import Node                               # noqa: E402
@@ -201,6 +202,12 @@ def _ros_thread_main() -> None:
     # optional override for the live grasp pipeline during showcase
     # runs.
     _demo_client = node.create_client(Trigger, "/moveit_control/demo")
+
+    # DemoPlace client — sibling of demo, calls
+    # /moveit_control/demo_place on the cpp node. Drives the arm to
+    # the DEMO PLACE pose, holds, opens gripper, parks at init.
+    # Surfaced to atlas as `manipulation/demo_place`.
+    _demo_place_client = node.create_client(Trigger, "/moveit_control/demo_place")
 
     def _arm_status_cb(msg):
         global _last_arm_status_value, _last_arm_status_stamp
@@ -362,6 +369,7 @@ from manipulation_mcp import (  # noqa: E402  pylint: disable=wrong-import-posit
     ExecuteGrasp_Request, ExecuteGrasp_Response,
     Reset_Request, Reset_Response,
     Demo_Request, Demo_Response,
+    DemoPlace_Request, DemoPlace_Response,
 )
 
 
@@ -625,6 +633,96 @@ def demo(_req: Demo_Request) -> Demo_Response:
     log.info("demo result: success=%s msg=%r elapsed=%.2fs",
              resp.success, resp.message, elapsed)
     return Demo_Response(
+        success=bool(resp.success),
+        message=str(resp.message),
+        elapsed_s=float(elapsed),
+    )
+
+
+@piper_moveit.mcp("robonix/service/manipulation/demo_place")
+def demo_place(_req: DemoPlace_Request) -> DemoPlace_Response:
+    """Drive the arm to a fixed DEMO PLACE pose, hold, open gripper,
+    park at init. Sibling of `manipulation/demo` for the "place"
+    half of a canned pick-and-place demo.
+
+    Internally calls /moveit_control/demo_place
+    (std_srvs/srv/Trigger) on the cpp moveit_control_node_yolo.
+    The cpp side:
+      * clears sticky state flags
+      * joint-space-moves to DEMO PLACE pose (degrees[] in cpp's
+        moveArmtoDemoPlace())
+      * sleeps place_open_pause_s (default 2.0 s)
+      * opens gripper to demo_gripper_width (default 0.08 m)
+      * joint-space-moves to init pose
+
+    For end-to-end pick + carry + place chained inside cpp, see the
+    raw ROS service /moveit_control/full_demo (no MCP front-door —
+    intended for ros2-service-call debugging).
+    """
+    with _state_lock:
+        if not _initialized:
+            return DemoPlace_Response(
+                success=False,
+                message="piper_moveit not initialized",
+                elapsed_s=0.0,
+            )
+        client = _demo_place_client
+        if client is None:
+            return DemoPlace_Response(
+                success=False,
+                message="rclpy bridge not ready (race? retry after 1s)",
+                elapsed_s=0.0,
+            )
+
+    from std_srvs.srv import Trigger  # noqa: E402
+
+    t0 = time.monotonic()
+    if not client.wait_for_service(timeout_sec=2.0):
+        return DemoPlace_Response(
+            success=False,
+            message=("/moveit_control/demo_place not advertised — "
+                     "is the cpp moveit_control_node_yolo alive AND "
+                     "rebuilt with the demo_place service?"),
+            elapsed_s=float(time.monotonic() - t0),
+        )
+
+    log.info("calling /moveit_control/demo_place on cpp moveit_control_node_yolo")
+    fut = client.call_async(Trigger.Request())
+
+    # Same 30s budget as reset / demo. demo_place internally does
+    # two arm motions plus a 2s gripper-open pause, so it can take
+    # noticeably longer than a single moveArmtoInit, but still well
+    # under 30s on a clear plan path.
+    deadline = time.monotonic() + 30.0
+    while not fut.done() and time.monotonic() < deadline:
+        if _ros_stop_evt.is_set():
+            return DemoPlace_Response(
+                success=False,
+                message="shutdown in progress",
+                elapsed_s=float(time.monotonic() - t0),
+            )
+        time.sleep(0.05)
+
+    elapsed = time.monotonic() - t0
+    if not fut.done():
+        return DemoPlace_Response(
+            success=False,
+            message=f"/moveit_control/demo_place timed out after {elapsed:.1f}s",
+            elapsed_s=float(elapsed),
+        )
+
+    try:
+        resp = fut.result()
+    except Exception as e:  # noqa: BLE001
+        return DemoPlace_Response(
+            success=False,
+            message=f"/moveit_control/demo_place call raised: {e}",
+            elapsed_s=float(elapsed),
+        )
+
+    log.info("demo_place result: success=%s msg=%r elapsed=%.2fs",
+             resp.success, resp.message, elapsed)
+    return DemoPlace_Response(
         success=bool(resp.success),
         message=str(resp.message),
         elapsed_s=float(elapsed),

@@ -1,0 +1,22 @@
+# Demo place — drive the arm to a fixed PLACE joint-space pose,
+# hold for a short pause, open the gripper to release the
+# imaginary object, then park back at init.
+#
+# Sibling of Demo.srv: same schema, same shape; cpp side runs
+# moveArmtoDemoPlace() + place_open_pause_s sleep + controlGripper
+# (demo_gripper_width) + moveArmtoInit() instead of just
+# moveArmtoDemo().
+#
+# Together with Demo.srv (the "pick" half), DemoPlace.srv lets a
+# pick_skill demo override mimic a full pick-and-place sequence
+# from the pilot's perspective. For end-to-end debugging without
+# pilot/atlas overhead, see /moveit_control/full_demo (raw ROS
+# Trigger service exposed by the cpp executor).
+
+# Request
+bool ack
+---
+# Response
+bool   success
+string message
+float32 elapsed_s

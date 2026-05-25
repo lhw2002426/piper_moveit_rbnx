@@ -1,0 +1,28 @@
+# Demo place — drive the arm to a fixed PLACE pose, hold, release,
+# park at init. Sibling of `manipulation/demo` (the "pick" half) for
+# canned showcase / pick-and-place demo runs.
+#
+# Internally calls /moveit_control/demo_place (std_srvs/srv/Trigger)
+# on the cpp moveit_control_node_yolo. The cpp side:
+#   * clears sticky state flags
+#   * joint-space-moves to the DEMO PLACE pose (degrees[] array
+#     baked into moveArmtoDemoPlace())
+#   * sleeps place_open_pause_s_ seconds (default 2.0)
+#   * opens gripper to demo_gripper_width_ (default 0.08)
+#   * joint-space-moves back to init pose
+#
+# Idempotent — calling demo_place twice in a row is identical to
+# once (the second call just re-runs the gesture).
+#
+# IDL: lib/manipulation/srv/DemoPlace.srv (package-local).
+[contract]
+id      = "robonix/service/manipulation/demo_place"
+version = "1"
+kind    = "service"
+idl     = "manipulation/srv/DemoPlace.srv"
+
+[mode]
+type = "rpc"
+
+[semantics]
+user_invocable = true
